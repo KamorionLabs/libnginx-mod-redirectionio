@@ -1,0 +1,146 @@
+name: Build ARM64 Debian packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_version:
+        description: 'Module version (e.g. 3.1.0-kamorion1)'
+        required: true
+        default: '3.1.0-kamorion1'
+      libredirectionio_ref:
+        description: 'libredirectionio git ref'
+        required: true
+        default: 'master'
+      create_release:
+        description: 'Create GitHub Release with .deb assets'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: bullseye
+            nginx_version: 1.18.0
+          - distro: bookworm
+            nginx_version: 1.22.1
+          - distro: trixie
+            nginx_version: 1.26.2
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config \
+            build-essential wget tar ca-certificates curl \
+            libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION=2.38.0
+          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout libredirectionio
+        uses: actions/checkout@v4
+        with:
+          repository: redirectionio/libredirectionio
+          ref: ${{ inputs.libredirectionio_ref }}
+          path: libredirectionio-src
+
+      - name: Build and install libredirectionio
+        working-directory: libredirectionio-src
+        run: |
+          autoreconf -vi
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+
+      - name: Build nginx module
+        run: |
+          autoreconf -vi
+          ./configure \
+            --with-nginx-version=${{ matrix.nginx_version }} \
+            --enable-debian-header
+          make -j$(nproc)
+
+      - name: Prepare load_module config
+        run: |
+          mkdir -p pkg/etc/nginx/modules-enabled
+          echo 'load_module /usr/lib/nginx/modules/ngx_http_redirectionio_module.so;' \
+            > pkg/etc/nginx/modules-enabled/50-mod-http-redirectionio.conf
+
+      - name: Package .deb
+        env:
+          VERSION: ${{ inputs.module_version }}
+          DISTRO: ${{ matrix.distro }}
+          NGINX_VERSION: ${{ matrix.nginx_version }}
+        run: |
+          mkdir -p dist
+          cat > /tmp/nfpm.yaml <<EOF
+          name: libnginx-mod-http-redirectionio
+          arch: arm64
+          platform: linux
+          version: ${VERSION}
+          release: 1~${DISTRO}
+          section: httpd
+          priority: optional
+          maintainer: Kamorion <infra@kamorion.com>
+          description: |
+            Nginx module for redirection.io (ARM64 build by Kamorion)
+            Upstream: https://github.com/redirectionio/libnginx-mod-redirectionio
+          homepage: https://github.com/KamorionLabs/libnginx-mod-redirectionio
+          license: MIT
+          depends:
+            - nginx
+          contents:
+            - src: nginx-${NGINX_VERSION}/objs/ngx_http_redirectionio_module.so
+              dst: /usr/lib/nginx/modules/ngx_http_redirectionio_module.so
+            - src: pkg/etc/nginx/modules-enabled/50-mod-http-redirectionio.conf
+              dst: /etc/nginx/modules-enabled/50-mod-http-redirectionio.conf
+          EOF
+          nfpm package \
+            --packager deb \
+            --config /tmp/nfpm.yaml \
+            --target "dist/libnginx-mod-http-redirectionio_${VERSION}-1~${DISTRO}_arm64.deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.distro }}-arm64
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: inputs.create_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.module_version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "v${VERSION}" \
+            --notes "ARM64 builds of libnginx-mod-redirectionio ${VERSION} for Debian bullseye, bookworm and trixie." \
+            dist/*.deb
