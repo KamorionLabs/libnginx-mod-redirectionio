@@ -24,25 +24,32 @@ jobs:
       matrix:
         include:
           - distro: bullseye
-            nginx_version: 1.18.0
             debian_image: debian:11-slim
           - distro: bookworm
-            nginx_version: 1.22.1
             debian_image: debian:12-slim
           - distro: trixie
-            nginx_version: 1.26.2
             debian_image: debian:13-slim
     container:
       image: ${{ matrix.debian_image }}
 
     steps:
+      - name: Enable source repositories
+        run: |
+          if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+            sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
+          else
+            sed -i -E 's/^deb (http.+)$/deb \1\ndeb-src \1/' /etc/apt/sources.list
+          fi
+          apt-get update
+
       - name: Install build dependencies
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends \
+            dpkg-dev build-essential \
             autoconf automake libtool pkg-config \
-            build-essential wget tar ca-certificates curl git \
-            libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev xz-utils
+            ca-certificates curl wget tar git xz-utils \
+            nginx
+          apt-get build-dep -y nginx
 
       - name: Checkout module
         uses: actions/checkout@v4
@@ -75,13 +82,26 @@ jobs:
           make install
           ldconfig
 
-      - name: Build nginx module
+      - name: Download Debian nginx source
         run: |
-          autoreconf -vi
-          ./configure \
-            --with-nginx-version=${{ matrix.nginx_version }} \
-            --enable-debian-header
-          make -j$(nproc)
+          mkdir -p nginx-build && cd nginx-build
+          apt source nginx
+          ls -d nginx-*/ > ../nginx-src-dir.txt
+          cat ../nginx-src-dir.txt
+
+      - name: Build nginx module against Debian nginx source
+        run: |
+          set -eux
+          MODULE_DIR="$GITHUB_WORKSPACE"
+          NGINX_SRC="$GITHUB_WORKSPACE/nginx-build/$(cat nginx-src-dir.txt)"
+          NGINX_ARGS=$(nginx -V 2>&1 | grep -oP 'configure arguments: \K.*')
+          NGINX_ARGS=$(echo "$NGINX_ARGS" | sed -E 's/--add-(dynamic-)?module=[^ ]*//g')
+          NGINX_VERSION=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')
+          cd "$NGINX_SRC"
+          eval ./configure "$NGINX_ARGS" --add-dynamic-module="$MODULE_DIR"
+          make -j$(nproc) modules
+          cp objs/ngx_http_redirectionio_module.so "$GITHUB_WORKSPACE/"
+          echo "NGINX_VERSION=$NGINX_VERSION" >> "$GITHUB_ENV"
 
       - name: Prepare load_module config
         run: |
@@ -93,7 +113,6 @@ jobs:
         env:
           VERSION: ${{ inputs.module_version }}
           DISTRO: ${{ matrix.distro }}
-          NGINX_VERSION: ${{ matrix.nginx_version }}
         run: |
           mkdir -p dist
           cat > /tmp/nfpm.yaml <<EOF
@@ -107,13 +126,14 @@ jobs:
           maintainer: Kamorion <infra@kamorion.com>
           description: |
             Nginx module for redirection.io (ARM64 build by Kamorion)
+            Built against Debian nginx ${NGINX_VERSION} source for binary compatibility.
             Upstream: https://github.com/redirectionio/libnginx-mod-redirectionio
           homepage: https://github.com/KamorionLabs/libnginx-mod-redirectionio
           license: MIT
           depends:
-            - nginx
+            - nginx (>= ${NGINX_VERSION})
           contents:
-            - src: nginx-${NGINX_VERSION}/objs/ngx_http_redirectionio_module.so
+            - src: ngx_http_redirectionio_module.so
               dst: /usr/lib/nginx/modules/ngx_http_redirectionio_module.so
             - src: pkg/etc/nginx/modules-enabled/50-mod-http-redirectionio.conf
               dst: /etc/nginx/modules-enabled/50-mod-http-redirectionio.conf
@@ -125,7 +145,6 @@ jobs:
 
       - name: Smoke test (dpkg -i + nginx -t)
         run: |
-          apt-get install -y --no-install-recommends nginx
           dpkg -i dist/*.deb
           nginx -t
 
@@ -156,5 +175,5 @@ jobs:
           gh release create "v${VERSION}" \
             --repo "${{ github.repository }}" \
             --title "v${VERSION}" \
-            --notes "ARM64 builds of libnginx-mod-redirectionio ${VERSION} for Debian bullseye, bookworm and trixie." \
+            --notes "ARM64 builds of libnginx-mod-redirectionio ${VERSION} for Debian bullseye, bookworm and trixie. Built against Debian nginx sources for binary compatibility with stock nginx packages." \
             dist/*.deb
