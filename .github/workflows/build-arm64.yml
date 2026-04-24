@@ -25,31 +25,39 @@ jobs:
         include:
           - distro: bullseye
             nginx_version: 1.18.0
+            debian_image: debian:11-slim
           - distro: bookworm
             nginx_version: 1.22.1
+            debian_image: debian:12-slim
           - distro: trixie
             nginx_version: 1.26.2
+            debian_image: debian:13-slim
+    container:
+      image: ${{ matrix.debian_image }}
 
     steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config \
+            build-essential wget tar ca-certificates curl git \
+            libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev xz-utils
+
       - name: Checkout module
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install Rust (via rustup)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool pkg-config \
-            build-essential wget tar ca-certificates curl \
-            libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install nfpm
         run: |
           NFPM_VERSION=2.38.0
           curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin nfpm
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+            | tar -xz -C /usr/local/bin nfpm
 
       - name: Checkout libredirectionio
         uses: actions/checkout@v4
@@ -64,8 +72,8 @@ jobs:
           autoreconf -vi
           ./configure --prefix=/usr/local
           make -j$(nproc)
-          sudo make install
-          sudo ldconfig
+          make install
+          ldconfig
 
       - name: Build nginx module
         run: |
@@ -114,6 +122,12 @@ jobs:
             --packager deb \
             --config /tmp/nfpm.yaml \
             --target "dist/libnginx-mod-http-redirectionio_${VERSION}-1~${DISTRO}_arm64.deb"
+
+      - name: Smoke test (dpkg -i + nginx -t)
+        run: |
+          apt-get install -y --no-install-recommends nginx
+          dpkg -i dist/*.deb
+          nginx -t
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
